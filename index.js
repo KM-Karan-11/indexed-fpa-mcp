@@ -102,7 +102,12 @@ function mergedActualsSnap(cloudRow, p) {
 
 const $ = n => (n < 0 ? `($${Math.abs(Math.round(n)).toLocaleString('en-US')})` : `$${Math.round(n).toLocaleString('en-US')}`);
 const fmtM = m => m; // 'Mon YYYY' as-is; kept as a hook if short-form display is wanted later
-const text = t => ({ content: [{ type: 'text', text: t }] });
+
+// Footer appended to every tool response. Override the wording with the RESPONSE_FOOTER env var
+// (no code change / redeploy of logic needed — just update the Railway variable).
+const FOOTER = process.env.RESPONSE_FOOTER ||
+  "For details, ping Karan on Slack or check Xero. This tool's data may not always be the latest — if any figure looks off, ask the team to refresh it.";
+const text = t => ({ content: [{ type: 'text', text: `${t}\n\n---\n_${FOOTER}_` }] });
 
 const ENTITY = z.enum(['conso', 'bh', 'bc']).optional().describe("Entity view: 'conso' (default, consolidated), 'bh' (Braveheart), 'bc' (Bravecore)");
 // Same id shape as the portal's modal, plus a per-batch counter so rows added in one bulk
