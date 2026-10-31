@@ -1075,15 +1075,23 @@ const transports = {};
 
 app.post('/mcp', async (req, res) => {
   const sid = req.headers['mcp-session-id'];
-  let transport = sid && transports[sid];
-  if (!transport) {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: id => { transports[id] = transport; },
-    });
-    transport.onclose = () => { if (transport.sessionId) delete transports[transport.sessionId]; };
-    await buildServer().connect(transport);
+  if (sid) {
+    // Known session: route to it. Unknown session (e.g. after a server restart or deploy):
+    // 404 tells the MCP client to re-initialize automatically — the previous behavior
+    // of silently creating a fresh (uninitialized) transport returned -32000 on every
+    // tool call until the user disconnected/reconnected the connector.
+    const transport = transports[sid];
+    if (!transport) { res.status(404).json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Session not found' } }); return; }
+    await transport.handleRequest(req, res, req.body);
+    return;
   }
+  // No session id: this must be the initialize call that opens one.
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: id => { transports[id] = transport; },
+  });
+  transport.onclose = () => { if (transport.sessionId) delete transports[transport.sessionId]; };
+  await buildServer().connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
 
