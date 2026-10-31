@@ -515,6 +515,127 @@ server.tool(
   }
 );
 
+server.tool(
+  'get_scorecard_numbers',
+  "Weekly scorecard numbers as *JSON* (not markdown) for Growth OS to feed into the Monday scorecard. One flat object, USD numbers, margins as 0..1 fractions. `cash` is closing cash at the last actual month; `avg_outflow` is YTD average monthly outflow; `revenue_last_month` is P&L revenue for the last actual month strictly before asOf (or the latest actual month if asOf isn't after any); `month_revenue_actual`/`month_revenue_booked` are P&L revenue and booked AR (status ≠ Draft) for asOf's month; `plan_*` fields cover the window 1 Nov 2026 → asOf (plan_net_profit uses per-month adj. net for actuals + forecast inflow−outflow for pure-forecast months, since the portal has no forecast P&L); `booked_next_month` is already-booked cash (status ≠ Draft) landing next month; `ar_over_30` is unpaid AR invoiced >30 days before asOf.",
+  {
+    asOf: z.string().describe("Date as YYYY-MM-DD. Determines the plan-window end and 'current month'."),
+    entity: ENTITY,
+  },
+  async ({ asOf, entity }) => {
+    const asOfDate = new Date(asOf);
+    if (isNaN(asOfDate.getTime())) throw new Error(`Invalid asOf: ${asOf} (expected YYYY-MM-DD)`);
+    const asOfYear = asOfDate.getUTCFullYear();
+    const asOfMonthIdx = asOfDate.getUTCMonth();
+
+    const { p } = await withPortal(entity || 'conso');
+
+    const payload = p.get(`(function(asOfIso, asOfYear, asOfMonthIdx){
+      const FY = Number(FCST_YEAR); // FCST_YEAR is a string in the portal; compare as numbers.
+      const cf = getD();
+      const pl = getPL();
+      const bs = getBSMetrics();
+
+      // Per-month P&L — read directly from the same template arrays getPL sums over.
+      const src = ent==='bh'?BH_PL:ent==='bc'?BC_PL:CONSO_PL;
+      const revLbl = ent==='bh'?'Total Trading Income':'Total Income';
+      const netLbl = ent==='bh'?'Net Profit':ent==='bc'?'Net Income':'Net Profit / Income';
+      const findRow = lbl => src.find(x=>x.label===lbl) || src.find(x=>x.label&&normKey(x.label).includes(normKey(lbl)));
+      const toArr = row => (row && row.v) || Array(E.length).fill(0);
+      const revByE = toArr(findRow(revLbl));
+      const netByE = toArr(findRow(netLbl));
+      const wagesByE = ent==='bc' ? Array(E.length).fill(0) : toArr(findRow('Wages and Salaries'));
+      const adjNetByE = netByE.map((v,i)=>(v||0)+(wagesByE[i]||0));
+
+      const asOfMonAbbr = ALL_MONTHS[asOfMonthIdx];
+      const asOfMonFull = asOfMonAbbr + ' ' + asOfYear;
+      const nextIdx = (asOfMonthIdx + 1) % 12;
+      const nextYear = nextIdx === 0 ? asOfYear + 1 : asOfYear;
+      const nextMonFull = ALL_MONTHS[nextIdx] + ' ' + nextYear;
+      const entMatch = r => (ent==='conso') || ((r.entity||'BH').toUpperCase() === ent.toUpperCase());
+
+      // revenue_last_month: last actual month strictly earlier than asOf; falls back to latest actual.
+      let lastClosedIdx = -1;
+      for (let i = E.length-1; i >= 0; i--) {
+        const mi = ALL_MONTHS.indexOf(E[i]);
+        if (asOfYear > FY || (asOfYear === FY && mi < asOfMonthIdx)) { lastClosedIdx = i; break; }
+      }
+      if (lastClosedIdx === -1 && E.length) lastClosedIdx = E.length - 1;
+      const revenue_last_month = lastClosedIdx >= 0 ? (revByE[lastClosedIdx] || 0) : 0;
+
+      const asOfEIdx = (asOfYear === FY) ? E.indexOf(asOfMonAbbr) : -1;
+      const month_revenue_actual = asOfEIdx >= 0 ? (revByE[asOfEIdx] || 0) : 0;
+
+      // Booked = any AR that isn't explicitly Draft (matches the portal's forecast semantics —
+      // a blank/missing status counts as invoiced for forecasting; Draft is the only exclusion).
+      const bookedForMonth = (monthFull) => AR_FCST
+        .filter(r => entMatch(r) && r.status !== 'Draft' && normalizeCashMonth(r.invoiceMonth) === monthFull)
+        .reduce((s,r) => s + (r.usdValue || r.amount || 0), 0);
+      const month_revenue_booked = bookedForMonth(asOfMonFull);
+
+      const month_inflow_fcst = getFcastInflow(asOfMonFull);
+      const month_outflow_fcst = getFcastOutflow(asOfMonFull);
+
+      // Plan window: Nov {FY} through asOf's month (inclusive).
+      const planMonths = [];
+      for (let mi = 10; mi <= 11; mi++) {
+        if (asOfYear === FY && mi > asOfMonthIdx) break;
+        planMonths.push({ abbr: ALL_MONTHS[mi], full: ALL_MONTHS[mi] + ' ' + FY });
+      }
+
+      let plan_revenue_actual = 0;
+      let plan_net_profit = 0;
+      let plan_revenue_booked = 0;
+      for (const pm of planMonths) {
+        const i = E.indexOf(pm.abbr);
+        if (i >= 0) {
+          plan_revenue_actual += (revByE[i] || 0);
+          plan_net_profit     += (adjNetByE[i] || 0);
+        } else {
+          plan_net_profit     += getFcastInflow(pm.full) - getFcastOutflow(pm.full);
+        }
+        plan_revenue_booked += bookedForMonth(pm.full);
+      }
+      // plan_revenue_booked already includes actuals' invoiced-not-Draft; promote booked beneath actual when actual is higher so Monday never sees booked < actual.
+      plan_revenue_booked = Math.max(plan_revenue_booked, plan_revenue_actual);
+
+      const booked_next_month = AR_FCST
+        .filter(r => entMatch(r) && r.status !== 'Draft' && normalizeCashMonth(r.cashMonth) === nextMonFull)
+        .reduce((s,r) => s + (r.cash || 0), 0);
+
+      const asOfMs = new Date(asOfIso + 'T23:59:59Z').getTime();
+      const THIRTY = 30 * 24 * 60 * 60 * 1000;
+      const ar_over_30 = AR_FCST
+        .filter(r => entMatch(r) && r.status && r.status !== 'Paid')
+        .filter(r => { const t = r.invoiceDate ? new Date(r.invoiceDate).getTime() : NaN; return !isNaN(t) && (asOfMs - t) > THIRTY; })
+        .reduce((s,r) => s + (r.cash || r.usdValue || r.amount || 0), 0);
+
+      const avg_outflow = cf.out.length ? cf.out.reduce((s,v)=>s+v,0) / cf.out.length : 0;
+
+      return {
+        cash: cf.close[cf.close.length-1] || 0,
+        avg_outflow,
+        receivables: bs.ar || 0,
+        ar_over_30,
+        revenue_last_month,
+        month_revenue_actual,
+        month_revenue_booked,
+        month_inflow_fcst,
+        month_outflow_fcst,
+        plan_revenue_actual,
+        plan_revenue_booked,
+        plan_net_profit,
+        booked_next_month,
+        gross_margin: pl.gpPct || 0,
+        net_margin: pl.adjNetPct || 0,
+      };
+    })(${JSON.stringify(asOf)}, ${asOfYear}, ${asOfMonthIdx})`);
+
+    // JSON only — this tool is machine-consumed by Growth OS; the FOOTER text() helper is skipped on purpose.
+    return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+  }
+);
+
 // ═══════════════════════════════ WRITE TOOLS ═════════════════════════════════
 
 const AR_ROW_FIELDS = {
