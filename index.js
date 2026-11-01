@@ -176,6 +176,13 @@ server.tool(
     const { p } = await withPortal(entity || 'conso');
     if (mode === 'actuals') p.run(`cfMode='actuals'; try{renderCF()}catch(_){};`);
     const s = p.get(`(function(){
+      if(typeof cfColumns==='function'){
+        // The portal's own statement: exactly the columns and last column the CF tab renders (unfiltered).
+        cfMonthSel=null; renderCF();
+        const v=_cfView;
+        return {mode:cfMode, ytdLabel:v.tot.label, ytdIn:v.tot.in, ytdOut:v.tot.out, rows:v.cols.map(function(c){
+          return {month:mFull(c.full),type:c.kind==='A'?'actual':c.held?'progress':'forecast',opening:c.open,inflow:c.in,outflow:c.out,net:c.in-c.out,fx:c.fx||0,closing:c.close};})};
+      }
       const d=getD();
       let cfActMonths,cfFcstMonths,actIn,actOut,actClose,actFX,actOpen;
       if(cfMode==='hybrid'&&E.length>1){
@@ -193,28 +200,29 @@ server.tool(
       cfActMonths.forEach(function(m,i){rows.push({month:m+' '+FCST_YEAR,type:'actual',opening:i===0?actOpen:actClose[i-1],inflow:actIn[i],outflow:actOut[i],net:actIn[i]-actOut[i],fx:actFX[i]||0,closing:actClose[i]});});
       let run=actClose.length?actClose[actClose.length-1]:actOpen;
       cfFcstMonths.forEach(function(m,fi){const op=run;run+=fcastIn[fi]-fcastOut[fi];rows.push({month:m,type:'forecast',opening:op,inflow:fcastIn[fi],outflow:fcastOut[fi],net:fcastIn[fi]-fcastOut[fi],fx:0,closing:run});});
-      return {mode:cfMode,rows:rows,ytdIn:actIn.reduce(function(s,v){return s+v;},0),ytdOut:actOut.reduce(function(s,v){return s+v;},0)};
+      return {mode:cfMode,ytdLabel:'YTD actuals',rows:rows,ytdIn:actIn.reduce(function(s,v){return s+v;},0),ytdOut:actOut.reduce(function(s,v){return s+v;},0)};
     })()`);
     const lines = [
       `## Cash flow statement — ${(entity || 'conso').toUpperCase()} (${s.mode})`,
       '',
       '| Month | | Opening | Inflow | Outflow | Net | Closing |',
       '|---|---|---|---|---|---|---|',
-      ...s.rows.map(r => `| ${r.month} | ${r.type === 'actual' ? 'A' : 'F'} | ${$(r.opening)} | ${$(r.inflow)} | ${$(r.outflow)} | ${$(r.net)} | **${$(r.closing)}** |`),
+      ...s.rows.map(r => `| ${r.month} | ${r.type === 'actual' ? 'A' : r.type === 'progress' ? 'F*' : 'F'} | ${$(r.opening)} | ${$(r.inflow)} | ${$(r.outflow)} | ${$(r.net)} | **${$(r.closing)}** |`),
       '',
-      `YTD actuals: inflow ${$(s.ytdIn)}, outflow ${$(s.ytdOut)}, net ${$(s.ytdIn - s.ytdOut)}`,
+      `${s.ytdLabel}: inflow ${$(s.ytdIn)}, outflow ${$(s.ytdOut)}, net ${$(s.ytdIn - s.ytdOut)}`,
     ];
+    if (s.rows.some(r => r.type === 'progress')) lines.push('', 'F* = month still in progress: inflow and outflow each take the larger of the actuals so far and the AR/AP forecast.');
     return text(lines.join('\n'));
   }
 );
 
 server.tool(
   'get_cf_groups',
-  'Cash flow broken down by display group (the drill-down level of the CF statement): per-month amounts per client/vendor group. In hybrid mode (default) the newest actual month is shown as forecast from the AR/AP pipeline, exactly as the portal CF table splits it.',
+  'Cash flow broken down by display group (the drill-down level of the CF statement): per-month amounts per client/vendor group, split into actual and forecast months exactly as the portal CF table does (finished months are actuals; a month still in progress is the first forecast month).',
   {
     entity: ENTITY,
     direction: z.enum(['inflow', 'outflow']).describe('Which side of the cash flow'),
-    mode: z.enum(['hybrid', 'actuals']).optional().describe("'hybrid' (default) splits the newest month as forecast; 'actuals' shows all GL actual months."),
+    mode: z.enum(['hybrid', 'actuals']).optional().describe("'hybrid' (default): actuals then forecast months; 'actuals' shows all GL actual months only."),
     include_forecast: z.boolean().optional().describe('Include forecast months from the AR/AP pipeline (default true)'),
   },
   async ({ entity, direction, mode, include_forecast }) => {
@@ -223,12 +231,20 @@ server.tool(
     const E = p.get('E');
     const FCST = p.get('FCST_MONTHS');
     const FY = p.get('FCST_YEAR');
-    // Mirror renderCFTable: hybrid holds back the last actual month and shows it as a forecast column.
+    // The portal's own split (finished months are actuals; a month still in progress is the first forecast
+    // column) and its drill-down groups, read after rendering the CF tab in the requested mode.
+    const view = p.get(`(function(){
+      if(typeof cfColumns!=='function')return null;
+      cfMode=${JSON.stringify(mode === 'actuals' ? 'actuals' : 'hybrid')}; cfMonthSel=null; renderCF();
+      return {act:_cfView.cols.filter(function(c){return c.kind==='A';}).map(function(c){return c.key;}),
+        fcst:_cfView.cols.filter(function(c){return c.kind==='F';}).map(function(c){return c.full;}),
+        actG:${isIn ? '_cfInGroups' : '_cfOutGroups'}, fcG:${isIn ? '_cfInFcstGroups' : '_cfOutFcstGroups'}};
+    })()`);
     const hybrid = mode !== 'actuals' && E.length > 1;
-    const actMonths = hybrid ? E.slice(0, -1) : E.slice();
-    const fcstMonths = include_forecast === false ? [] : (hybrid ? [`${E[E.length - 1]} ${FY}`, ...FCST] : FCST);
-    const act = p.get(`buildCFGroups(${isIn})`);
-    const fcst = fcstMonths.length ? p.get(`buildFcastCFGroups(${isIn}, ${JSON.stringify(fcstMonths)})`) : [];
+    const actMonths = view ? view.act : (hybrid ? E.slice(0, -1) : E.slice());
+    const fcstMonths = include_forecast === false ? [] : view ? view.fcst : (hybrid ? [`${E[E.length - 1]} ${FY}`, ...FCST] : FCST);
+    const act = view ? view.actG : p.get(`buildCFGroups(${isIn})`);
+    const fcst = !fcstMonths.length ? [] : view ? view.fcG : p.get(`buildFcastCFGroups(${isIn}, ${JSON.stringify(fcstMonths)})`);
     const lines = [`## ${isIn ? 'Cash inflow' : 'Cash outflow'} by group — ${(entity || 'conso').toUpperCase()}`, ''];
     lines.push(`**Actuals (${actMonths[0]}–${actMonths[actMonths.length - 1]} ${FY}):**`);
     act.forEach(g => {
@@ -288,13 +304,23 @@ server.tool(
   {},
   async () => {
     const { p } = await withPortal('conso');
-    const d = p.get(`({months:E.slice(), bh:BH_BANKS, bc:BC_BANKS})`);
+    // The portal's own account list (what its CF tab shows): the template accounts plus any that exist only
+    // in the imported Balance Sheets (e.g. Fixed Deposit - WIO, WIO - US Dollar). BH_BANKS/BC_BANKS alone
+    // miss those, which understated cash by ~$200k.
+    const d = p.get(`(function(){
+      const rows=typeof _bankRowsFromImport==='function'?_bankRowsFromImport()
+        :Object.entries(BH_BANKS).map(function(e){return {name:e[0],entity:'BH',v:e[1]};})
+          .concat(Object.entries(BC_BANKS).map(function(e){return {name:e[0],entity:'BC',v:e[1]};}));
+      return {months:typeof mFull==='function'?E.map(mFull):E.slice(), rows:rows, close:getD().close};
+    })()`);
     const lines = ['## Bank account breakdown', '', `| Account | Entity | ${d.months.join(' | ')} |`, `|---|---|${d.months.map(() => '---').join('|')}|`];
-    for (const [ent2, banks] of [['BH', d.bh], ['BC', d.bc]]) {
-      for (const [name, vals] of Object.entries(banks)) {
-        lines.push(`| ${name} | ${ent2} | ${d.months.map((_, i) => $(vals[i] || 0)).join(' | ')} |`);
-      }
+    const tot = d.months.map(() => 0);
+    for (const r of d.rows) {
+      lines.push(`| ${r.name} | ${r.entity} | ${d.months.map((_, i) => { tot[i] += r.v[i] || 0; return $(r.v[i] || 0); }).join(' | ')} |`);
     }
+    lines.push(`| **Total** | BH+BC | ${tot.map(v => `**${$(v)}**`).join(' | ')} |`);
+    const gaps = d.months.filter((_, i) => Math.abs(tot[i] - (d.close[i] || 0)) > 1);
+    if (gaps.length) lines.push('', `⚠ The accounts don't add up to the closing bank balance in ${gaps.join(', ')} — check that month's Balance Sheet import.`);
     return text(lines.join('\n'));
   }
 );
