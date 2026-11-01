@@ -123,37 +123,44 @@ const server = new McpServer({ name: 'indexed-fpa', version: '2.0.0' });
 
 server.tool(
   'get_dashboard_metrics',
-  'All dashboard KPIs exactly as the portal computes them: closing cash, AR, YTD inflow/outflow/net, founder payments, Founder Cash Earnings, Dec closing forecast, revenue/GP/adj-net P&L metrics, 2026 full-year revenue, and liabilities.',
+  'All dashboard KPIs exactly as the portal computes them for its reporting year (the year of the latest actual month): closing cash, AR, YTD inflow/outflow/net, founder payments, Founder Cash Earnings, Dec closing forecast, revenue/GP/adj-net P&L metrics, full-year revenue (YTD + forecast to Dec), and liabilities.',
   { entity: ENTITY },
   async ({ entity }) => {
     const { p } = await withPortal(entity || 'conso');
     const m = p.get(`(function(){
       const d=getD();
-      const ytdIn=d.in.reduce(function(s,v){return s+v;},0), ytdOut=d.out.reduce(function(s,v){return s+v;},0);
+      // Same reporting year and helpers as the portal's renderDash (older portals: all of E is 2026).
+      const yr=typeof dashYear==='function'?dashYear():Number(FCST_YEAR);
+      const yIdx=typeof yearIdx==='function'?yearIdx(yr):E.map(function(_,i){return i;});
+      const full=function(m){return typeof mFull==='function'?mFull(m):(/\d{4}/.test(m)?m:m+' '+FCST_YEAR);};
+      const ytdIn=yIdx.reduce(function(s,i){return s+d.in[i];},0), ytdOut=yIdx.reduce(function(s,i){return s+d.out[i];},0);
       const founderPmt=getFounderPayments();
       const decClose=getDecClosingBalance();
+      const openYr=typeof getYearOpening==='function'?getYearOpening(yr):d.open;
       const pl=getPL(), bs=getBSMetrics();
-      const idx=FCST_MONTHS.findIndex(function(x){return x.startsWith('Dec');});
-      const fcstRevTotal=FCST_MONTHS.slice(0, idx+1||undefined).reduce(function(s,x){return s+getFcastInflow(x);},0);
-      return { actualMonths:E.slice(), fcstMonths:FCST_MONTHS.slice(), openingJan:d.open,
+      const fcstYr=FCST_MONTHS.filter(function(x){return full(x).slice(-4)===String(yr);});
+      const fcstRevTotal=fcstYr.reduce(function(s,x){return s+getFcastInflow(x);},0);
+      const rng=function(x,y){return typeof mRange==='function'?mRange(x,y):full(x)+'–'+full(y);};
+      return { year:yr, actualMonths:E.map(full), actRange:rng(E[0],E[E.length-1]), ytdRange:rng(E[yIdx[0]||0],E[E.length-1]),
+        fcstRange:FCST_MONTHS.length?rng(FCST_MONTHS[0],FCST_MONTHS[FCST_MONTHS.length-1]):'—', openingJan:openYr,
         closingCash:d.close[d.close.length-1], monthlyClosing:d.close, ar:bs.ar,
         ytdInflow:ytdIn, ytdOutflow:ytdOut, netMovement:ytdIn-ytdOut,
         founderPayments:founderPmt, adjNetMovement:ytdIn-ytdOut+founderPmt,
-        decClosingForecast:decClose, founderCashEarnings:decClose-d.open+founderPmt,
+        decClosingForecast:decClose, founderCashEarnings:decClose-openYr+founderPmt,
         pl:pl, liabilities:{accountsPayable:bs.ap, accruals:bs.accruals, directorsLoanAcct:bs.dirLoan, loanFromDirector:bs.loanDir},
-        fullYearRev2026:pl.ytdRev+fcstRevTotal };
+        fullYearRev:pl.ytdRev+fcstRevTotal };
     })()`);
     const lines = [
       `## Dashboard — ${(entity || 'conso').toUpperCase()}`,
-      `Actuals: ${m.actualMonths[0]}–${m.actualMonths[m.actualMonths.length - 1]} 2026 · Forecast: ${m.fcstMonths[0]}–${m.fcstMonths[m.fcstMonths.length - 1]}`,
+      `Actuals: ${m.actRange} · Forecast: ${m.fcstRange} · YTD = ${m.ytdRange}`,
       '',
-      `**Closing cash balance:** ${$(m.closingCash)} (${m.actualMonths[m.actualMonths.length - 1]} 2026)`,
+      `**Closing cash balance:** ${$(m.closingCash)} (${m.actualMonths[m.actualMonths.length - 1]})`,
       `**Accounts receivable:** ${$(m.ar)}`,
       `**YTD inflow:** ${$(m.ytdInflow)} · **YTD outflow:** ${$(m.ytdOutflow)} · **Net:** ${$(m.netMovement)}`,
-      `**Founder payments (Jan–Dec):** ${$(m.founderPayments)}`,
-      `**Founder cash earnings:** ${$(m.founderCashEarnings)} (Dec close ${$(m.decClosingForecast)} − Jan open ${$(m.openingJan)} + founder payments)`,
+      `**Founder payments (Jan–Dec ${m.year}):** ${$(m.founderPayments)}`,
+      `**Founder cash earnings:** ${$(m.founderCashEarnings)} (Dec ${m.year} close ${$(m.decClosingForecast)} − Jan ${m.year} open ${$(m.openingJan)} + founder payments)`,
       '',
-      `**2026 revenue (YTD + forecast to Dec):** ${$(m.fullYearRev2026)}`,
+      `**${m.year} revenue (YTD + forecast to Dec):** ${$(m.fullYearRev)}`,
       `**YTD revenue:** ${$(m.pl.ytdRev)} · **YTD gross profit:** ${$(m.pl.ytdGP)} (${(m.pl.gpPct * 100).toFixed(1)}%)`,
       `**Adj. net profit:** ${$(m.pl.adjNet)} (${(m.pl.adjNetPct * 100).toFixed(1)}%)`,
       '',
@@ -269,13 +276,14 @@ server.tool(
   'Transaction-level drill-down for an actual month: every GL cash transaction with date, contact, entity, amount, resolved display group, any override, and its tx_key (used by set_cf_override).',
   {
     entity: ENTITY,
-    month: z.string().describe("Actual month, short name e.g. 'Jul'"),
+    month: z.string().describe("Actual month: 'Jul' or 'Jul 2026' for 2026, 'Jan 2027' for later years"),
     direction: z.enum(['inflow', 'outflow']),
     group: z.string().optional().describe('Only transactions resolving to this display group'),
   },
   async ({ entity, month, direction, group }) => {
     const { p } = await withPortal(entity || 'conso');
     const txs = p.get(`(function(mo,isIn,grpF){
+      if(typeof mKey==='function')mo=mKey(mo); // the portal keys 2026 months bare ('Jul'), other years 'Jan 2027'
       const merged=getMergedMap(); const out=[];
       const list=isIn?(BH_IN_D[mo]||[]).concat(BC_IN_D[mo]||[]):(BH_OUT_D[mo]||[]).concat(BC_OUT_D[mo]||[]);
       list.forEach(function(tx){
@@ -334,12 +342,12 @@ server.tool(
   },
   async ({ entity, statement }) => {
     const { p } = await withPortal('conso');
-    const fin = p.get(`(window._importedFin||{})[${JSON.stringify(entity + '_' + statement)}] || null`);
+    const fin = p.get(`(function(f){if(f&&typeof mFull==='function')f.labels=f.months.map(mFull);return f;})((window._importedFin||{})[${JSON.stringify(entity + '_' + statement)}] || null)`);
     if (!fin) return text(`No imported ${statement.toUpperCase()} for ${entity.toUpperCase()}. Import it on the portal's Import tab or via import_xero_data.`);
     const lines = [
-      `## ${entity.toUpperCase()} ${statement === 'bs' ? 'Balance Sheet' : 'P&L'} (${fin.months.join(', ')})`,
+      `## ${entity.toUpperCase()} ${statement === 'bs' ? 'Balance Sheet' : 'P&L'} (${(fin.labels || fin.months).join(', ')})`,
       '',
-      `| Line | ${fin.months.join(' | ')} |`,
+      `| Line | ${(fin.labels || fin.months).join(' | ')} |`,
       `|---|${fin.months.map(() => '---').join('|')}|`,
     ];
     fin.rows.forEach(r => {
@@ -558,6 +566,10 @@ server.tool(
 
     const payload = p.get(`(function(asOfIso, asOfYear, asOfMonthIdx){
       const FY = Number(FCST_YEAR); // FCST_YEAR is a string in the portal; compare as numbers.
+      // Actual-month keys: bare for FY ('Jan'), 'Mon YYYY' for other years ('Jan 2027'). Use the portal's
+      // helpers when present; older portals only ever held FY months.
+      const ordOf = k => typeof mOrd==='function' ? mOrd(k) : FY*12 + ALL_MONTHS.indexOf(k);
+      const keyOf = full => typeof mKey==='function' ? mKey(full) : (full.slice(-4)===String(FY) ? full.slice(0,3) : full);
       const cf = getD();
       const pl = getPL();
       const bs = getBSMetrics();
@@ -582,14 +594,14 @@ server.tool(
 
       // revenue_last_month: last actual month strictly earlier than asOf; falls back to latest actual.
       let lastClosedIdx = -1;
+      const asOfOrd = asOfYear*12 + asOfMonthIdx;
       for (let i = E.length-1; i >= 0; i--) {
-        const mi = ALL_MONTHS.indexOf(E[i]);
-        if (asOfYear > FY || (asOfYear === FY && mi < asOfMonthIdx)) { lastClosedIdx = i; break; }
+        if (ordOf(E[i]) < asOfOrd) { lastClosedIdx = i; break; }
       }
       if (lastClosedIdx === -1 && E.length) lastClosedIdx = E.length - 1;
       const revenue_last_month = lastClosedIdx >= 0 ? (revByE[lastClosedIdx] || 0) : 0;
 
-      const asOfEIdx = (asOfYear === FY) ? E.indexOf(asOfMonAbbr) : -1;
+      const asOfEIdx = E.indexOf(keyOf(asOfMonFull));
       const month_revenue_actual = asOfEIdx >= 0 ? (revByE[asOfEIdx] || 0) : 0;
 
       // Booked = any AR that isn't explicitly Draft (matches the portal's forecast semantics —
@@ -617,8 +629,7 @@ server.tool(
       let plan_net_profit = 0;
       let plan_revenue_booked = 0;
       for (const pm of planMonths) {
-        // E only holds actual months of FCST_YEAR, so a month from any other year is never an actual.
-        const i = pm.year === FY ? E.indexOf(pm.abbr) : -1;
+        const i = E.indexOf(keyOf(pm.full)); // an actual month of any year (2027 actuals included)
         if (i >= 0) {
           plan_revenue_actual += (revByE[i] || 0);
           plan_net_profit     += (adjNetByE[i] || 0);
@@ -641,7 +652,9 @@ server.tool(
         .filter(r => { const t = r.invoiceDate ? new Date(r.invoiceDate).getTime() : NaN; return !isNaN(t) && (asOfMs - t) > THIRTY; })
         .reduce((s,r) => s + (r.cash || r.usdValue || r.amount || 0), 0);
 
-      const avg_outflow = cf.out.length ? cf.out.reduce((s,v)=>s+v,0) / cf.out.length : 0;
+      // YTD = the portal's reporting year (year of the latest actual month)
+      const ytdIdx = typeof yearIdx==='function' ? yearIdx(dashYear()) : cf.out.map((_,i)=>i);
+      const avg_outflow = ytdIdx.length ? ytdIdx.reduce((s,i)=>s+cf.out[i],0) / ytdIdx.length : 0;
 
       return {
         cash: cf.close[cf.close.length-1] || 0,
