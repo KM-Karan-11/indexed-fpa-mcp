@@ -86,6 +86,24 @@ async function commentsRequest(method, query, body) {
   return method === 'GET' ? res.json() : null;
 }
 
+// Strict month check + sanity warnings via the portal's own strictMonth/rowWarnings (older portals: no check).
+// Throws, writing nothing, if any month value is ambiguous ('Jan-27', bare 'Jun', '01/27').
+function checkRowMonths(p, rows, keys, label) {
+  if (!p.get(`typeof strictMonth==='function'`)) return rows;
+  const bad = [];
+  rows.forEach((r, i) => keys.forEach(k => {
+    if (r[k] === undefined || r[k] === '') return;
+    const v = p.get(`strictMonth(${JSON.stringify(r[k])})`);
+    if (v === null) bad.push(`${label(r, i)}: ${k} "${r[k]}"`); else r[k] = v;
+  }));
+  if (bad.length) throw new Error(`Nothing written — month values must be 'Mon YYYY', 'Month YYYY' or an ISO date (ambiguous forms like 'Jan-27' are rejected):\n${bad.join('\n')}`);
+  return rows;
+}
+function rowWarnLines(p, side, rows, label) {
+  if (!p.get(`typeof rowWarnings==='function'`)) return [];
+  return rows.flatMap((r, i) => p.get(`rowWarnings(${JSON.stringify(side)}, ${JSON.stringify(r)})`).map(w => `⚠ ${label(r, i)}: ${w}`));
+}
+
 // ── Headless portal session ──────────────────────────────────────────────────
 
 async function withPortal(entity = 'conso') {
@@ -280,6 +298,67 @@ server.tool(
       });
     }
     return text(lines.join('\n'));
+  }
+);
+
+server.tool(
+  'replace_forecast',
+  "Plan sync, in one atomic save: on one side (AR or AP) delete every row tagged source='plan' and insert the given rows as the new plan rows (tagged 'plan'). Manual rows (e.g. open AR invoices, anything added by hand) and rows in closed months (up to 'books closed through') are never touched; new rows dated in a closed month are skipped and reported. Months must be 'Mon YYYY', 'Month YYYY' or ISO dates — any ambiguous value rejects the whole call (nothing written). Row ids are derived from content, so running it twice with the same input leaves identical data. Returns totals by month and entity before and after.",
+  {
+    side: z.enum(['ar', 'ap']),
+    rows: z.array(z.object({}).passthrough()).describe('AR rows: same fields as add_ar_rows; AP rows: same fields as add_ap_rows'),
+    replace_untagged: z.boolean().optional().describe("First sync only: also treat untagged rows (synced before source tags existed) in open months as plan rows — on AR only Draft ones (Invoiced/Partial/Overdue/Paid invoices are always kept). Default false — untagged rows count as manual."),
+  },
+  async ({ side, rows, replace_untagged }) => {
+    const { p } = await withPortal();
+    if (!p.get(`typeof strictMonth==='function'&&typeof booksClosedOrd==='function'`)) throw new Error('This portal version does not support replace_forecast yet.');
+    const AR = side === 'ar';
+    checkRowMonths(p, rows, AR ? ['cashMonth', 'invoiceMonth'] : ['cashMonth', 'workMonth'], (r, i) => `row ${i + 1} (${(AR ? r.client : r.vendor) || '?'})`);
+    const res = p.get(`(function(side,rows,untagged){
+      const AR=side==='ar', arr=AR?AR_FCST:AP_FCST, closed=booksClosedOrd();
+      const cm=function(r){return mOrd(normalizeCashMonth(r.cashMonth));};
+      const inClosed=function(r){const o=cm(r);return !isNaN(o)&&o<=closed;};
+      // untagged rows only with replace_untagged — and on AR only Draft ones: booked invoices are never plan rows
+      const isPlan=function(r){return r.source==='plan'||(untagged&&!r.source&&(!AR||r.status==='Draft'));};
+      const errors=[], skipped=[], fresh=[], seen={};
+      rows.forEach(function(r,i){
+        const name=AR?r.client:r.vendor;
+        if(!name){errors.push('row '+(i+1)+': '+(AR?'client':'vendor')+' is required');return;}
+        if(!r.entity)r.entity='BH';
+        if(AR){if(!r.currency)r.currency='USD';if(!r.status)r.status='Draft';}
+        if(!r.cashMonth&&r.paymentDate){const m=/^(\\d{4})-(\\d{2})/.exec(String(r.paymentDate));if(m)r.cashMonth=ALL_MONTHS[+m[2]-1]+' '+m[1];}
+        if(!r.cashMonth){errors.push('row '+(i+1)+' ('+name+'): needs cashMonth or paymentDate');return;}
+        r.source='plan';
+        if(AR)recalcARRow(r);else recalcAPRow(r);
+        if(inClosed(r)){skipped.push(name+' · '+r.cashMonth);return;}
+        const base=[side,r.entity,name,normalizeCashMonth(r.cashMonth),AR?(r.amount||0):(r.amount||0),AR?(r.invoiceMonth||''):(r.workMonth||'')].join('|');
+        seen[base]=(seen[base]||0)+1;
+        r.id='plan-'+side+'-'+dsVersion(base+'#'+seen[base]).replace(/\\./g,'');
+        fresh.push(r);
+      });
+      if(errors.length)return {errors:errors};
+      const totals=function(list){const t={};list.forEach(function(r){const k=(normalizeCashMonth(r.cashMonth)||'(none)')+'|'+(r.entity||'BH').toUpperCase();t[k]=(t[k]||0)+(AR?(r.cash||0):(r.amount||0));});return t;};
+      const before=totals(arr);
+      const drop=function(r){return isPlan(r)&&!inClosed(r);};
+      const removed=arr.filter(drop).length, kept=arr.filter(function(r){return !drop(r);});
+      const next=kept.concat(fresh);
+      const tk='__tomb__||'+side+'_fcst'; // the sheet is the source of truth for plan rows: re-inserted ids are not deleted rows
+      if(CT_MAP[tk]&&CT_MAP[tk].ids)fresh.forEach(function(r){delete CT_MAP[tk].ids[String(r.id)];});
+      if(AR)AR_FCST=next;else AP_FCST=next;
+      recomputeFcstMonths();
+      return {removed:removed, inserted:fresh.length, kept:kept.length, skipped:skipped, before:before, after:totals(next)};
+    })(${JSON.stringify(side)}, ${JSON.stringify(rows)}, ${!!replace_untagged})`);
+    if (res.errors) throw new Error(`Nothing written — fix these rows:\n${res.errors.join('\n')}`);
+    const note = await sbPatch({ [AR ? 'ar_fcst' : 'ap_fcst']: p.get(AR ? 'AR_FCST' : 'AP_FCST'), ct_map: p.get('CT_MAP') }, p);
+    const keys = [...new Set([...Object.keys(res.before), ...Object.keys(res.after)])]
+      .sort((a, b) => p.get(`mOrd(${JSON.stringify(a.split('|')[0])})`) - p.get(`mOrd(${JSON.stringify(b.split('|')[0])})`) || a.localeCompare(b));
+    const tbl = keys.map(k => { const [m, e] = k.split('|'), b = res.before[k] || 0, a = res.after[k] || 0;
+      return `| ${m} | ${e} | ${$(b)} | ${$(a)} | ${Math.abs(a - b) < 0.005 ? '—' : (a > b ? '+' : '') + $(a - b)} |`; });
+    return text(note + [
+      `## replace_forecast (${side.toUpperCase()}): removed ${res.removed} plan row(s), inserted ${res.inserted}, kept ${res.kept} manual/closed-month row(s)`,
+      ...(res.skipped.length ? ['', `Skipped ${res.skipped.length} row(s) dated in closed months: ${res.skipped.join('; ')}`] : []),
+      '', `| Month | Entity | Before | After | Change |`, '|---|---|---|---|---|', ...tbl,
+    ].join('\n'));
   }
 );
 
@@ -618,6 +697,7 @@ server.tool(
 
     const payload = p.get(`(function(asOfIso, asOfYear, asOfMonthIdx){
       const FY = Number(FCST_YEAR); // FCST_YEAR is a string in the portal; compare as numbers.
+      const BOOKED = ['Invoiced','Partial','Overdue','Paid']; // only explicit statuses count as booked; blank = Draft
       // Actual-month keys: bare for FY ('Jan'), 'Mon YYYY' for other years ('Jan 2027'). Use the portal's
       // helpers when present; older portals only ever held FY months.
       const ordOf = k => typeof mOrd==='function' ? mOrd(k) : FY*12 + ALL_MONTHS.indexOf(k);
@@ -661,7 +741,7 @@ server.tool(
       // Booked = any AR that isn't explicitly Draft (matches the portal's forecast semantics —
       // a blank/missing status counts as invoiced for forecasting; Draft is the only exclusion).
       const bookedForMonth = (monthFull) => AR_FCST
-        .filter(r => entMatch(r) && r.status !== 'Draft' && normalizeCashMonth(r.invoiceMonth) === monthFull)
+        .filter(r => entMatch(r) && BOOKED.indexOf(r.status) >= 0 && normalizeCashMonth(r.invoiceMonth) === monthFull)
         .reduce((s,r) => s + (r.usdValue || r.amount || 0), 0);
       const month_revenue_booked = bookedForMonth(asOfMonFull);
 
@@ -696,7 +776,7 @@ server.tool(
       plan_revenue_booked = Math.max(plan_revenue_booked, plan_revenue_actual);
 
       const booked_next_month = AR_FCST
-        .filter(r => entMatch(r) && r.status !== 'Draft' && normalizeCashMonth(r.cashMonth) === nextMonFull)
+        .filter(r => entMatch(r) && BOOKED.indexOf(r.status) >= 0 && normalizeCashMonth(r.cashMonth) === nextMonFull)
         .reduce((s,r) => s + (r.cash || 0), 0);
 
       const asOfMs = new Date(asOfIso + 'T23:59:59Z').getTime();
@@ -762,10 +842,12 @@ server.tool(
   { rows: z.array(z.object(AR_ROW_FIELDS)).min(1) },
   async ({ rows }) => {
     const { p } = await withPortal();
+    checkRowMonths(p, rows, ['cashMonth', 'invoiceMonth'], (r, i) => r.client || `row ${i + 1}`);
     const added = p.get(`(function(rows){
       const out=[];
       rows.forEach(function(r,_i){
         r.id=${NEW_ID};
+        if(!r.source)r.source='manual';
         if(!r.status)r.status='Draft';
         if(!r.entity)r.entity='BH';
         if(!r.currency)r.currency='USD';
@@ -777,7 +859,8 @@ server.tool(
       return out;
     })(${JSON.stringify(rows)})`);
     const note = await sbPatch({ ar_fcst: p.get('AR_FCST') }, p);
-    const warn = added.filter(r => !r.cashMonth).map(r => `⚠ ${r.client}: no cashMonth/paymentDate — will not show in any forecast month.`);
+    const warn = added.filter(r => !r.cashMonth).map(r => `⚠ ${r.client}: no cashMonth/paymentDate — will not show in any forecast month.`)
+      .concat(rowWarnLines(p, 'AR', added, r => r.client));
     return text(note + ['## Added ' + added.length + ' AR row(s)', '', ...added.map(r => `- \`${r.id}\` ${r.client} (${r.entity}) ${r.status} · inv ${r.invoiceMonth || '—'} → cash ${r.cashMonth || '—'} · ${$(r.amount)} → cash ${$(r.cash)}`), ...(warn.length ? ['', ...warn] : [])].join('\n'));
   }
 );
@@ -809,6 +892,7 @@ server.tool(
   },
   async ({ updates }) => {
     const { p } = await withPortal();
+    checkRowMonths(p, updates, ['cashMonth'], u => u.id);
     const log = p.get(`(function(ups){
       const log=[];
       ups.forEach(function(u){
@@ -830,7 +914,8 @@ server.tool(
       return log;
     })(${JSON.stringify(updates)})`);
     const note = await sbPatch({ ar_fcst: p.get('AR_FCST') }, p);
-    return text(note + ['## AR updates', '', ...log.map(l => '- ' + l)].join('\n'));
+    const touched = p.get(`AR_FCST.filter(function(r){return ${JSON.stringify(updates.map(u => String(u.id)))}.indexOf(String(r.id))>=0;})`);
+    return text(note + ['## AR updates', '', ...log.map(l => '- ' + l), ...rowWarnLines(p, 'AR', touched, r => r.client)].join('\n'));
   }
 );
 
@@ -872,10 +957,12 @@ server.tool(
   { rows: z.array(z.object(AP_ROW_FIELDS)).min(1) },
   async ({ rows }) => {
     const { p } = await withPortal();
+    checkRowMonths(p, rows, ['cashMonth', 'workMonth'], (r, i) => r.vendor || `row ${i + 1}`);
     const added = p.get(`(function(rows){
       const out=[];
       rows.forEach(function(r,_i){
         r.id=${NEW_ID};
+        if(!r.source)r.source='manual';
         if(!r.entity)r.entity='BH';
         recalcAPRow(r);
         AP_FCST.push(r); out.push(r);
@@ -884,7 +971,7 @@ server.tool(
       return out;
     })(${JSON.stringify(rows)})`);
     const note = await sbPatch({ ap_fcst: p.get('AP_FCST') }, p);
-    return text(note + ['## Added ' + added.length + ' AP row(s)', '', ...added.map(r => `- \`${r.id}\` ${r.vendor} (${r.entity}) · cash ${r.cashMonth || '—'} · ${$(r.amount)} · ${r.spendType || '—'}/${r.expenseCategory || '—'}`)].join('\n'));
+    return text(note + ['## Added ' + added.length + ' AP row(s)', '', ...added.map(r => `- \`${r.id}\` ${r.vendor} (${r.entity}) · cash ${r.cashMonth || '—'} · ${$(r.amount)} · ${r.spendType || '—'}/${r.expenseCategory || '—'}`), ...rowWarnLines(p, 'AP', added, r => r.vendor)].join('\n'));
   }
 );
 
