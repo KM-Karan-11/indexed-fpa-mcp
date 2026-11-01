@@ -44,21 +44,28 @@ async function sbGet() {
   return rows[0];
 }
 
-// Patches ONLY the given columns — never the whole state — so a concurrent
-// portal session editing a different column is never clobbered.
-async function sbPatch(cols) {
+// Patches ONLY the given columns — never the whole state — so a concurrent portal session editing a different
+// column is never clobbered. Conditional on the row being unchanged since this request read it (p.readAt), so a
+// save made meanwhile (a portal tab, another request) is never overwritten with this request's older copy.
+async function sbPatch(cols, p) {
   const payload = { ...cols, updated_at: new Date().toISOString(), updated_by: 'claude-mcp' };
   if (DRY_RUN) {
     console.log('[DRY RUN] PATCH forecast_data:', Object.keys(cols).join(', '));
     return '[DRY RUN — no data written] ';
   }
   const { url } = await ensureSB();
-  const res = await fetch(`${url}/rest/v1/forecast_data?id=eq.1`, {
+  const pre = p && 'readAt' in p ? (p.readAt ? `&updated_at=eq.${encodeURIComponent(p.readAt)}` : '&updated_at=is.null') : '';
+  const res = await fetch(`${url}/rest/v1/forecast_data?id=eq.1${pre}&select=id`, {
     method: 'PATCH',
-    headers: { ...(await sbHeaders()), Prefer: 'return=minimal' },
+    headers: { ...(await sbHeaders()), Prefer: 'return=representation' },
     body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`Supabase PATCH failed: ${await res.text()}`);
+  const rows = await res.json().catch(() => []);
+  if (pre && (!Array.isArray(rows) || !rows.length)) {
+    throw new Error('Not saved: the portal data changed while this request was running (someone saved at the same moment). Nothing was written — run the same request again.');
+  }
+  if (p) p.readAt = payload.updated_at;
   return '';
 }
 
@@ -85,6 +92,7 @@ async function withPortal(entity = 'conso') {
   const row = await sbGet();
   const p = await hydrate(row);
   p.setEntity(entity);
+  p.readAt = row.updated_at || null; // writes are conditional on this (see sbPatch)
   return { row, p };
 }
 
@@ -131,14 +139,14 @@ server.tool(
       const d=getD();
       // Same reporting year and helpers as the portal's renderDash (older portals: all of E is 2026).
       const yr=typeof dashYear==='function'?dashYear():Number(FCST_YEAR);
-      const yIdx=typeof yearIdx==='function'?yearIdx(yr):E.map(function(_,i){return i;});
+      const yIdx=typeof reportIdx==='function'?reportIdx(yr):typeof yearIdx==='function'?yearIdx(yr):E.map(function(_,i){return i;});
       const full=function(m){return typeof mFull==='function'?mFull(m):(/\d{4}/.test(m)?m:m+' '+FCST_YEAR);};
       const ytdIn=yIdx.reduce(function(s,i){return s+d.in[i];},0), ytdOut=yIdx.reduce(function(s,i){return s+d.out[i];},0);
       const founderPmt=getFounderPayments();
       const decClose=getDecClosingBalance();
       const openYr=typeof getYearOpening==='function'?getYearOpening(yr):d.open;
       const pl=getPL(), bs=getBSMetrics();
-      const fcstYr=FCST_MONTHS.filter(function(x){return full(x).slice(-4)===String(yr);});
+      const fcstYr=(typeof cfForecastMonths==='function'?cfForecastMonths():FCST_MONTHS).filter(function(x){return full(x).slice(-4)===String(yr);});
       const fcstRevTotal=fcstYr.reduce(function(s,x){return s+getFcastInflow(x);},0);
       const rng=function(x,y){return typeof mRange==='function'?mRange(x,y):full(x)+'–'+full(y);};
       return { year:yr, actualMonths:E.map(full), actRange:rng(E[0],E[E.length-1]), ytdRange:rng(E[yIdx[0]||0],E[E.length-1]),
@@ -187,7 +195,9 @@ server.tool(
         // The portal's own statement: exactly the columns and last column the CF tab renders (unfiltered).
         cfMonthSel=null; renderCF();
         const v=_cfView;
-        return {mode:cfMode, ytdLabel:v.tot.label, ytdIn:v.tot.in, ytdOut:v.tot.out, rows:v.cols.map(function(c){
+        const late=typeof closedPipelineRows==='function'?closedPipelineRows():[];
+        return {mode:cfMode, closedThrough:typeof booksClosedOrd==='function'?mFromOrd(booksClosedOrd()):null, closedSet:typeof getSetting==='function'&&!!getSetting('booksClosedThrough'), late:late.length,
+          ytdLabel:v.tot.label, ytdIn:v.tot.in, ytdOut:v.tot.out, rows:v.cols.map(function(c){
           return {month:mFull(c.full),type:c.kind==='A'?'actual':c.held?'progress':'forecast',opening:c.open,inflow:c.in,outflow:c.out,net:c.in-c.out,fx:c.fx||0,closing:c.close};})};
       }
       const d=getD();
@@ -218,7 +228,9 @@ server.tool(
       '',
       `${s.ytdLabel}: inflow ${$(s.ytdIn)}, outflow ${$(s.ytdOut)}, net ${$(s.ytdIn - s.ytdOut)}`,
     ];
-    if (s.rows.some(r => r.type === 'progress')) lines.push('', 'F* = month still in progress: inflow and outflow each take the larger of the actuals so far and the AR/AP forecast.');
+    if (s.closedThrough) lines.splice(1, 0, `Books closed through ${s.closedThrough}${s.closedSet ? '' : ' (auto: the month before this one)'} — months up to it are GL actuals; the forecast opens from its closing.`);
+    if (s.rows.some(r => r.type === 'progress')) lines.push('', 'F* = after the books-closed month but already partly imported — forecast from the AR/AP pipeline, not the partial GL.');
+    if (s.late) lines.push('', `⚠ ${s.late} pipeline row(s) fall in closed months and are not in the forecast — see get_settings.`);
     return text(lines.join('\n'));
   }
 );
@@ -268,6 +280,43 @@ server.tool(
       });
     }
     return text(lines.join('\n'));
+  }
+);
+
+server.tool(
+  'get_settings',
+  'Shared portal settings. "Books closed through": months up to and including it always show GL actuals in the cash flow, dashboard and scorecard; the forecast starts the month after, opening from its actual closing. Also lists AR/AP pipeline rows dated in closed months (they are left out of the forecast).',
+  {},
+  async () => {
+    const { p } = await withPortal('conso');
+    const s = p.get(`({set:typeof getSetting==='function'?getSetting('booksClosedThrough'):null,
+      eff:typeof booksClosedOrd==='function'?mFromOrd(booksClosedOrd()):null, actual:E.map(mFull),
+      late:typeof closedPipelineRows==='function'?closedPipelineRows():[]})`);
+    if (!s.eff) return text('This portal version has no books-closed setting yet.');
+    return text([
+      '## Settings', '',
+      `**Books closed through:** ${s.eff}${s.set ? '' : ' (auto — not set: every month before the current calendar month)'}`,
+      `Imported actual months: ${s.actual[0]}–${s.actual[s.actual.length - 1]}`,
+      '',
+      s.late.length ? `⚠ ${s.late.length} pipeline row(s) fall in closed months (not in the forecast):` : 'No pipeline rows fall in closed months.',
+      ...s.late.map(r => `- ${r.side} \`${r.id}\` ${r.name} (${r.entity}) · ${r.month} · ${$(r.amount)}${r.status ? ' · ' + r.status : ''}`),
+    ].join('\n'));
+  }
+);
+
+server.tool(
+  'set_books_closed_through',
+  'Set the shared "Books closed through" month (e.g. "Oct 2026"), or clear it (empty string) to go back to automatic (the month before the current calendar month). Changes the cash flow, dashboard and scorecard for everyone.',
+  { month: z.string().describe("'Mon YYYY', e.g. 'Oct 2026'; empty to clear") },
+  async ({ month }) => {
+    const m = String(month || '').trim();
+    if (m && !/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}$/.test(m)) throw new Error(`Invalid month "${m}" — use 'Mon YYYY', e.g. 'Oct 2026'.`);
+    const { p } = await withPortal('conso');
+    if (!p.get(`typeof setSetting==='function'`)) throw new Error('This portal version has no books-closed setting.');
+    const r = p.get(`(function(m){setSetting('booksClosedThrough',m||null);return {eff:mFromOrd(booksClosedOrd()),last:mFull(E[E.length-1])};})(${JSON.stringify(m)})`);
+    const note = await sbPatch({ ct_map: p.get('CT_MAP') }, p);
+    const warn = m && p.get(`mOrd(${JSON.stringify(m)})>mOrd(E[E.length-1])`) ? `\n⚠ ${m} is after the last imported month (${r.last}); months without GL data can't be shown as actuals.` : '';
+    return text(note + `Books closed through: ${r.eff}${m ? '' : ' (auto)'}.` + warn);
   }
 );
 
@@ -327,7 +376,8 @@ server.tool(
       lines.push(`| ${r.name} | ${r.entity} | ${d.months.map((_, i) => { tot[i] += r.v[i] || 0; return $(r.v[i] || 0); }).join(' | ')} |`);
     }
     lines.push(`| **Total** | BH+BC | ${tot.map(v => `**${$(v)}**`).join(' | ')} |`);
-    const gaps = d.months.filter((_, i) => Math.abs(tot[i] - (d.close[i] || 0)) > 1);
+    lines.push(`| _Difference vs cash flow closing_ | | ${tot.map((v, i) => Math.abs(v - (d.close[i] || 0)) < 0.5 ? '—' : `**${$(v - (d.close[i] || 0))}**`).join(' | ')} |`);
+    const gaps = d.months.filter((_, i) => Math.abs(tot[i] - (d.close[i] || 0)) >= 0.5);
     if (gaps.length) lines.push('', `⚠ The accounts don't add up to the closing bank balance in ${gaps.join(', ')} — check that month's Balance Sheet import.`);
     return text(lines.join('\n'));
   }
@@ -372,7 +422,8 @@ server.tool(
   },
   async (f) => {
     const row = await sbGet();
-    const rows = (row.ar_fcst || []).filter(r =>
+    const tomb = new Set(Object.keys(((row.ct_map || {})['__tomb__||ar_fcst'] || {}).ids || {}));
+    const rows = (row.ar_fcst || []).filter(r => !tomb.has(String(r.id))).filter(r =>
       (!f.client || (r.client || '').toLowerCase().includes(f.client.toLowerCase())) &&
       (!f.entity || r.entity === f.entity) &&
       (!f.cash_month || r.cashMonth === f.cash_month) &&
@@ -403,7 +454,8 @@ server.tool(
   },
   async (f) => {
     const row = await sbGet();
-    const rows = (row.ap_fcst || []).filter(r =>
+    const tomb = new Set(Object.keys(((row.ct_map || {})['__tomb__||ap_fcst'] || {}).ids || {}));
+    const rows = (row.ap_fcst || []).filter(r => !tomb.has(String(r.id))).filter(r =>
       (!f.vendor || (r.vendor || '').toLowerCase().includes(f.vendor.toLowerCase())) &&
       (!f.entity || r.entity === f.entity) &&
       (!f.cash_month || r.cashMonth === f.cash_month) &&
@@ -570,6 +622,8 @@ server.tool(
       // helpers when present; older portals only ever held FY months.
       const ordOf = k => typeof mOrd==='function' ? mOrd(k) : FY*12 + ALL_MONTHS.indexOf(k);
       const keyOf = full => typeof mKey==='function' ? mKey(full) : (full.slice(-4)===String(FY) ? full.slice(0,3) : full);
+      // Only months up to "books closed through" count as actuals (the portal's rule); later months are forecast.
+      const closedN = typeof closedCount==='function' ? closedCount() : E.length;
       const cf = getD();
       const pl = getPL();
       const bs = getBSMetrics();
@@ -595,10 +649,10 @@ server.tool(
       // revenue_last_month: last actual month strictly earlier than asOf; falls back to latest actual.
       let lastClosedIdx = -1;
       const asOfOrd = asOfYear*12 + asOfMonthIdx;
-      for (let i = E.length-1; i >= 0; i--) {
+      for (let i = closedN-1; i >= 0; i--) {
         if (ordOf(E[i]) < asOfOrd) { lastClosedIdx = i; break; }
       }
-      if (lastClosedIdx === -1 && E.length) lastClosedIdx = E.length - 1;
+      if (lastClosedIdx === -1 && closedN) lastClosedIdx = closedN - 1;
       const revenue_last_month = lastClosedIdx >= 0 ? (revByE[lastClosedIdx] || 0) : 0;
 
       const asOfEIdx = E.indexOf(keyOf(asOfMonFull));
@@ -629,8 +683,8 @@ server.tool(
       let plan_net_profit = 0;
       let plan_revenue_booked = 0;
       for (const pm of planMonths) {
-        const i = E.indexOf(keyOf(pm.full)); // an actual month of any year (2027 actuals included)
-        if (i >= 0) {
+        const i = E.indexOf(keyOf(pm.full)); // an actual month of any year (2027 actuals included)…
+        if (i >= 0 && i < closedN) {        // …that is closed
           plan_revenue_actual += (revByE[i] || 0);
           plan_net_profit     += (adjNetByE[i] || 0);
         } else {
@@ -653,7 +707,7 @@ server.tool(
         .reduce((s,r) => s + (r.cash || r.usdValue || r.amount || 0), 0);
 
       // YTD = the portal's reporting year (year of the latest actual month)
-      const ytdIdx = typeof yearIdx==='function' ? yearIdx(dashYear()) : cf.out.map((_,i)=>i);
+      const ytdIdx = typeof reportIdx==='function' ? reportIdx(dashYear()) : typeof yearIdx==='function' ? yearIdx(dashYear()) : cf.out.map((_,i)=>i);
       const avg_outflow = ytdIdx.length ? ytdIdx.reduce((s,i)=>s+cf.out[i],0) / ytdIdx.length : 0;
 
       return {
@@ -722,7 +776,7 @@ server.tool(
       recomputeFcstMonths();
       return out;
     })(${JSON.stringify(rows)})`);
-    const note = await sbPatch({ ar_fcst: p.get('AR_FCST') });
+    const note = await sbPatch({ ar_fcst: p.get('AR_FCST') }, p);
     const warn = added.filter(r => !r.cashMonth).map(r => `⚠ ${r.client}: no cashMonth/paymentDate — will not show in any forecast month.`);
     return text(note + ['## Added ' + added.length + ' AR row(s)', '', ...added.map(r => `- \`${r.id}\` ${r.client} (${r.entity}) ${r.status} · inv ${r.invoiceMonth || '—'} → cash ${r.cashMonth || '—'} · ${$(r.amount)} → cash ${$(r.cash)}`), ...(warn.length ? ['', ...warn] : [])].join('\n'));
   }
@@ -775,7 +829,7 @@ server.tool(
       recomputeFcstMonths();
       return log;
     })(${JSON.stringify(updates)})`);
-    const note = await sbPatch({ ar_fcst: p.get('AR_FCST') });
+    const note = await sbPatch({ ar_fcst: p.get('AR_FCST') }, p);
     return text(note + ['## AR updates', '', ...log.map(l => '- ' + l)].join('\n'));
   }
 );
@@ -790,10 +844,11 @@ server.tool(
       const before=AR_FCST.length;
       const gone=AR_FCST.filter(function(r){return ids.indexOf(String(r.id))>=0;}).map(function(r){return r.client+' '+(r.invoiceMonth||'')+' '+(r.cash||r.amount||0);});
       AR_FCST=AR_FCST.filter(function(r){return ids.indexOf(String(r.id))<0;});
+      if(typeof addTombs==='function')addTombs('ar_fcst',ids); // a stale client can never bring them back
       recomputeFcstMonths();
       return {gone:gone, removed:before-AR_FCST.length};
     })(${JSON.stringify(ids.map(String))})`);
-    const note = await sbPatch({ ar_fcst: p.get('AR_FCST') });
+    const note = await sbPatch({ ar_fcst: p.get('AR_FCST'), ct_map: p.get('CT_MAP') }, p);
     return text(note + `Deleted ${removed.removed} AR row(s):\n${removed.gone.map(g => '- ' + g).join('\n')}`);
   }
 );
@@ -828,7 +883,7 @@ server.tool(
       recomputeFcstMonths();
       return out;
     })(${JSON.stringify(rows)})`);
-    const note = await sbPatch({ ap_fcst: p.get('AP_FCST') });
+    const note = await sbPatch({ ap_fcst: p.get('AP_FCST') }, p);
     return text(note + ['## Added ' + added.length + ' AP row(s)', '', ...added.map(r => `- \`${r.id}\` ${r.vendor} (${r.entity}) · cash ${r.cashMonth || '—'} · ${$(r.amount)} · ${r.spendType || '—'}/${r.expenseCategory || '—'}`)].join('\n'));
   }
 );
@@ -865,7 +920,7 @@ server.tool(
       recomputeFcstMonths();
       return log;
     })(${JSON.stringify(updates)})`);
-    const note = await sbPatch({ ap_fcst: p.get('AP_FCST') });
+    const note = await sbPatch({ ap_fcst: p.get('AP_FCST') }, p);
     return text(note + ['## AP updates', '', ...log.map(l => '- ' + l)].join('\n'));
   }
 );
@@ -880,10 +935,11 @@ server.tool(
       const before=AP_FCST.length;
       const gone=AP_FCST.filter(function(r){return ids.indexOf(String(r.id))>=0;}).map(function(r){return r.vendor+' '+(r.cashMonth||'')+' '+(r.amount||0);});
       AP_FCST=AP_FCST.filter(function(r){return ids.indexOf(String(r.id))<0;});
+      if(typeof addTombs==='function')addTombs('ap_fcst',ids); // a stale client can never bring them back
       recomputeFcstMonths();
       return {gone:gone, removed:before-AP_FCST.length};
     })(${JSON.stringify(ids.map(String))})`);
-    const note = await sbPatch({ ap_fcst: p.get('AP_FCST') });
+    const note = await sbPatch({ ap_fcst: p.get('AP_FCST'), ct_map: p.get('CT_MAP') }, p);
     return text(note + `Deleted ${removed.removed} AP row(s):\n${removed.gone.map(g => '- ' + g).join('\n')}`);
   }
 );
@@ -912,7 +968,7 @@ server.tool(
       });
       return log;
     })(${JSON.stringify(mappings)})`);
-    const note = await sbPatch({ ct_map: p.get('CT_MAP') });
+    const note = await sbPatch({ ct_map: p.get('CT_MAP') }, p);
     return text(note + ['## Contact mappings', '', ...log.map(l => '- ' + l)].join('\n'));
   }
 );
@@ -946,7 +1002,7 @@ server.tool(
       return log;
     })(${JSON.stringify(key)}, ${JSON.stringify(add || [])}, ${JSON.stringify(remove || [])})`);
     const chk = mergedActualsSnap(row, p);
-    const note = await sbPatch({ gl_mappings: p.get('GL_MAPPINGS'), actuals_snap: chk.snap });
+    const note = await sbPatch({ gl_mappings: p.get('GL_MAPPINGS'), actuals_snap: chk.snap }, p);
     return text(note + ['## GL mappings (' + key + ')', '', ...log.map(l => '- ' + l), ...(chk.missing.length ? [`\n(note: preserved cloud actuals not re-parsed this session: ${chk.missing.join(', ')})`] : [])].join('\n'));
   }
 );
@@ -980,7 +1036,7 @@ server.tool(
       return n>USER_ROWS.length?'Deleted row "'+a.label+'"':'Row not found';
     })(${JSON.stringify({ action, entity, statement, section, label, xero })})`);
     const chk = mergedActualsSnap(row, p);
-    const note = await sbPatch({ gl_mappings: p.get('GL_MAPPINGS'), actuals_snap: chk.snap });
+    const note = await sbPatch({ gl_mappings: p.get('GL_MAPPINGS'), actuals_snap: chk.snap }, p);
     return text(note + msg + (chk.missing.length ? `\n(note: preserved cloud actuals not re-parsed this session: ${chk.missing.join(', ')})` : ''));
   }
 );
@@ -1007,7 +1063,7 @@ server.tool(
       return log;
     })(${JSON.stringify(tx_key)}, ${JSON.stringify(display_group || null)}, ${JSON.stringify(net_against || null)}, ${JSON.stringify(!!clear)})`);
     if (!msg.length) return text('Nothing to do — pass display_group, net_against, or clear.');
-    const note = await sbPatch({ cf_tx_overrides: p.get('CF_TX_OVERRIDES'), cf_net_overrides: p.get('CF_NET_OVERRIDES') });
+    const note = await sbPatch({ cf_tx_overrides: p.get('CF_TX_OVERRIDES'), cf_net_overrides: p.get('CF_NET_OVERRIDES') }, p);
     return text(note + msg.map(l => '- ' + l).join('\n'));
   }
 );
@@ -1039,7 +1095,7 @@ server.tool(
       return sum;
     })(${JSON.stringify(raw_rows)}, ${JSON.stringify(entity)}, ${JSON.stringify(ftype)})`);
     if (summary.error) return text(`⚠ Import failed: ${summary.error}`);
-    const note = await sbPatch({ actuals_snap: mergedActualsSnap(row, p).snap });
+    const note = await sbPatch({ actuals_snap: mergedActualsSnap(row, p).snap }, p);
     return text(note + [
       `## Imported ${entity.toUpperCase()} ${ftype.toUpperCase()}`,
       `Months: ${summary.months.join(', ')}`,
