@@ -517,7 +517,7 @@ server.tool(
 
 server.tool(
   'get_scorecard_numbers',
-  "Weekly scorecard numbers as *JSON* (not markdown) for Growth OS to feed into the Monday scorecard. One flat object, USD numbers, margins as 0..1 fractions. `cash` is closing cash at the last actual month; `avg_outflow` is YTD average monthly outflow; `revenue_last_month` is P&L revenue for the last actual month strictly before asOf (or the latest actual month if asOf isn't after any); `month_revenue_actual`/`month_revenue_booked` are P&L revenue and booked AR (status ≠ Draft) for asOf's month; `plan_*` fields cover the window 1 Nov 2026 → asOf (plan_net_profit uses per-month adj. net for actuals + forecast inflow−outflow for pure-forecast months, since the portal has no forecast P&L); `booked_next_month` is already-booked cash (status ≠ Draft) landing next month; `ar_over_30` is unpaid AR invoiced >30 days before asOf.",
+  "Weekly scorecard numbers as *JSON* (not markdown) for Growth OS to feed into the Monday scorecard. One flat object, USD numbers, margins as 0..1 fractions. `cash` is closing cash at the last actual month; `avg_outflow` is YTD average monthly outflow; `revenue_last_month` is P&L revenue for the last actual month strictly before asOf (or the latest actual month if asOf isn't after any); `month_revenue_actual`/`month_revenue_booked` are P&L revenue and booked AR (status ≠ Draft) for asOf's month; `plan_*` fields cover the window 1 Nov 2026 → asOf, carrying across year ends, with `plan_window` listing the months included (plan_net_profit uses per-month adj. net for actuals + forecast inflow−outflow for pure-forecast months, since the portal has no forecast P&L); `booked_next_month` is already-booked cash (status ≠ Draft) landing next month; `ar_over_30` is unpaid AR invoiced >30 days before asOf.",
   {
     asOf: z.string().describe("Date as YYYY-MM-DD. Determines the plan-window end and 'current month'."),
     entity: ENTITY,
@@ -576,18 +576,23 @@ server.tool(
       const month_inflow_fcst = getFcastInflow(asOfMonFull);
       const month_outflow_fcst = getFcastOutflow(asOfMonFull);
 
-      // Plan window: Nov {FY} through asOf's month (inclusive).
+      // Plan window: 1 Nov 2026 through asOf's month (inclusive), walking across year ends so the
+      // window keeps growing into 2027 and beyond. The start is the year plan's start, so it is
+      // fixed rather than tied to FCST_YEAR. Capped at 36 months as a guard for a far-future asOf.
+      const PLAN_START_YEAR = 2026, PLAN_START_MONTH = 10; // Nov 2026
       const planMonths = [];
-      for (let mi = 10; mi <= 11; mi++) {
-        if (asOfYear === FY && mi > asOfMonthIdx) break;
-        planMonths.push({ abbr: ALL_MONTHS[mi], full: ALL_MONTHS[mi] + ' ' + FY });
+      for (let y = PLAN_START_YEAR, mi = PLAN_START_MONTH;
+           (y < asOfYear || (y === asOfYear && mi <= asOfMonthIdx)) && planMonths.length < 36;
+           mi === 11 ? (mi = 0, y++) : mi++) {
+        planMonths.push({ abbr: ALL_MONTHS[mi], year: y, full: ALL_MONTHS[mi] + ' ' + y });
       }
 
       let plan_revenue_actual = 0;
       let plan_net_profit = 0;
       let plan_revenue_booked = 0;
       for (const pm of planMonths) {
-        const i = E.indexOf(pm.abbr);
+        // E only holds actual months of FCST_YEAR, so a month from any other year is never an actual.
+        const i = pm.year === FY ? E.indexOf(pm.abbr) : -1;
         if (i >= 0) {
           plan_revenue_actual += (revByE[i] || 0);
           plan_net_profit     += (adjNetByE[i] || 0);
@@ -626,6 +631,7 @@ server.tool(
         plan_revenue_booked,
         plan_net_profit,
         booked_next_month,
+        plan_window: planMonths.map(pm => pm.full),
         gross_margin: pl.gpPct || 0,
         net_margin: pl.adjNetPct || 0,
       };
