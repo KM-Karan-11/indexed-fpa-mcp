@@ -1145,8 +1145,9 @@ server.tool(
     // which would hit Object.prototype's setter and silently store nothing while reporting success).
     if (!tx_key.includes('||')) return text("Invalid tx_key — expected 'date||contact||entity||account' from get_cf_transactions.");
     const { p } = await withPortal();
-    if (p.get(`typeof txByKey==='function'`)) {
-      // Must be a real transaction; netting only against a contact with a receipt that entity+month (portal's rule)
+    if ((display_group || net_against) && p.get(`typeof txByKey==='function'`)) {
+      // Setting needs a real transaction; netting only against a contact with a receipt that entity+month (portal's
+      // rule). Clearing is always allowed, so an override whose transaction has gone can still be removed.
       const found = p.get(`!!(txByKey(${JSON.stringify(tx_key)},true)||txByKey(${JSON.stringify(tx_key)},false))`);
       if (!found) return text(`No transaction has tx_key "${tx_key}" — get it from get_cf_transactions.`);
       if (net_against) {
