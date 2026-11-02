@@ -165,7 +165,8 @@ server.tool(
       const openYr=typeof getYearOpening==='function'?getYearOpening(yr):d.open;
       const pl=getPL(), bs=getBSMetrics();
       const fcstYr=(typeof cfForecastMonths==='function'?cfForecastMonths():FCST_MONTHS).filter(function(x){return full(x).slice(-4)===String(yr);});
-      const fcstRevTotal=fcstYr.reduce(function(s,x){return s+getFcastInflow(x);},0);
+      const fyr=typeof getFullYearRev==='function'?getFullYearRev(yr):null; // portal: P&L YTD + invoiced AR to Dec
+      const fcstRevTotal=fyr?fyr.forecast:fcstYr.reduce(function(s,x){return s+getFcastInflow(x);},0);
       const rng=function(x,y){return typeof mRange==='function'?mRange(x,y):full(x)+'–'+full(y);};
       return { year:yr, actualMonths:E.map(full), actRange:rng(E[0],E[E.length-1]), ytdRange:rng(E[yIdx[0]||0],E[E.length-1]),
         fcstRange:FCST_MONTHS.length?rng(FCST_MONTHS[0],FCST_MONTHS[FCST_MONTHS.length-1]):'—', openingJan:openYr,
@@ -174,7 +175,7 @@ server.tool(
         founderPayments:founderPmt, adjNetMovement:ytdIn-ytdOut+founderPmt,
         decClosingForecast:decClose, founderCashEarnings:decClose-openYr+founderPmt,
         pl:pl, liabilities:{accountsPayable:bs.ap, accruals:bs.accruals, directorsLoanAcct:bs.dirLoan, loanFromDirector:bs.loanDir},
-        fullYearRev:pl.ytdRev+fcstRevTotal };
+        fullYearRev:fyr?fyr.total:pl.ytdRev+fcstRevTotal, revBasis:fyr?'P&L YTD + invoiced to Dec':'YTD + forecast to Dec' };
     })()`);
     const lines = [
       `## Dashboard — ${(entity || 'conso').toUpperCase()}`,
@@ -186,7 +187,7 @@ server.tool(
       `**Founder payments (Jan–Dec ${m.year}):** ${$(m.founderPayments)}`,
       `**Founder cash earnings:** ${$(m.founderCashEarnings)} (Dec ${m.year} close ${$(m.decClosingForecast)} − Jan ${m.year} open ${$(m.openingJan)} + founder payments)`,
       '',
-      `**${m.year} revenue (YTD + forecast to Dec):** ${$(m.fullYearRev)}`,
+      `**${m.year} revenue (${m.revBasis}):** ${$(m.fullYearRev)}`,
       `**YTD revenue:** ${$(m.pl.ytdRev)} · **YTD gross profit:** ${$(m.pl.ytdGP)} (${(m.pl.gpPct * 100).toFixed(1)}%)`,
       `**Adj. net profit:** ${$(m.pl.adjNet)} (${(m.pl.adjNetPct * 100).toFixed(1)}%)`,
       '',
@@ -414,10 +415,12 @@ server.tool(
       if(typeof mKey==='function')mo=mKey(mo); // the portal keys 2026 months bare ('Jul'), other years 'Jan 2027'
       const merged=getMergedMap(); const out=[];
       const list=isIn?(BH_IN_D[mo]||[]).concat(BC_IN_D[mo]||[]):(BH_OUT_D[mo]||[]).concat(BC_OUT_D[mo]||[]);
+      // The portal's per-transaction keys: same-day duplicates get '||#2'…, older keys are unchanged
+      const keys=typeof txKeyMap==='function'?txKeyMap(isIn):null;
       list.forEach(function(tx){
         if(ent!=='conso'&&tx.entity!==ent.toUpperCase())return;
         if(!isIn&&isFee(tx.contact))return;
-        const k=(tx.date||'')+'||'+tx.contact+'||'+tx.entity+'||'+(tx.account||'');
+        const k=(keys&&keys.get(tx))||((tx.date||'')+'||'+tx.contact+'||'+tx.entity+'||'+(tx.account||''));
         const grp=CF_TX_OVERRIDES[k]||(merged[tx.contact+'||'+tx.entity]||{}).group||tx.contact;
         if(grpF&&grp!==grpF)return;
         out.push({date:tx.date||'',contact:tx.contact,entity:tx.entity,amount:tx.amt,fee:tx.fee||0,account:tx.account||'',group:grp,override:CF_TX_OVERRIDES[k]||null,nettedAgainst:CF_NET_OVERRIDES[k]===true?tx.contact:(CF_NET_OVERRIDES[k]||null),tx_key:k});
@@ -1132,7 +1135,7 @@ server.tool(
   'set_cf_override',
   "Per-transaction CF Working overrides: reassign a transaction's display group, net an outflow against a client inflow (fee netting), or clear overrides. Get tx_key from get_cf_transactions. NOTE: unlike the portal (where these only sync piggybacked on other saves), this writes to the cloud immediately.",
   {
-    tx_key: z.string().describe("From get_cf_transactions, format 'date||contact||entity||account'"),
+    tx_key: z.string().describe("From get_cf_transactions: 'date||contact||entity||account', plus '||#2', '||#3'… for later same-day duplicates"),
     display_group: z.string().optional().describe('Reassign this tx to a display group'),
     net_against: z.string().optional().describe('Outflows only: inflow contact name to net this against'),
     clear: z.boolean().optional().describe('Clear both overrides for this tx'),
@@ -1142,6 +1145,16 @@ server.tool(
     // which would hit Object.prototype's setter and silently store nothing while reporting success).
     if (!tx_key.includes('||')) return text("Invalid tx_key — expected 'date||contact||entity||account' from get_cf_transactions.");
     const { p } = await withPortal();
+    if (p.get(`typeof txByKey==='function'`)) {
+      // Must be a real transaction; netting only against a contact with a receipt that entity+month (portal's rule)
+      const found = p.get(`!!(txByKey(${JSON.stringify(tx_key)},true)||txByKey(${JSON.stringify(tx_key)},false))`);
+      if (!found) return text(`No transaction has tx_key "${tx_key}" — get it from get_cf_transactions.`);
+      if (net_against) {
+        const t = p.get(`cfNetTarget(${JSON.stringify(tx_key)},${JSON.stringify(net_against)})`);
+        if (!t) return text(`Can't net against "${net_against}": it has no receipt in that payment's entity and month. Pick a contact with a receipt then (see get_cf_transactions inflow).`);
+        net_against = t;
+      }
+    }
     const msg = p.get(`(function(k,dg,na,clr){
       const log=[];
       if(clr){ delete CF_TX_OVERRIDES[k]; delete CF_NET_OVERRIDES[k]; log.push('cleared overrides for '+k); }
